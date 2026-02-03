@@ -7,9 +7,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.SubmissionPublisher;
 
@@ -43,6 +46,7 @@ import io.quarkus.deployment.util.ArtifactInfoUtil;
 import io.quarkus.dev.console.DevConsoleManager;
 import io.quarkus.devservices.common.StartableContainer;
 import io.quarkus.devui.spi.buildtime.FooterLogBuildItem;
+import io.quarkus.maven.dependency.ResolvedDependency;
 import io.quarkus.runtime.RuntimeValue;
 import io.quarkus.runtime.util.ClassPathUtils;
 import io.quarkus.vertx.http.deployment.NonApplicationRootPathBuildItem;
@@ -99,6 +103,82 @@ public class ChappieProcessor {
 
         footerLogProducer.produce(new FooterLogBuildItem("Assistant", chappieLog));
 
+    }
+
+    /**
+     * Detects active documentation libraries from application dependencies.
+     * Maps Quarkus extensions and dependencies to their corresponding documentation libraries.
+     */
+    @BuildStep
+    public void detectActiveLibraries(
+            CurateOutcomeBuildItem curateOutcomeBuildItem,
+            BuildProducer<ActiveLibrariesBuildItem> activeLibrariesProducer) {
+
+        Set<String> libraries = new HashSet<>();
+
+        // Always include Quarkus documentation
+        libraries.add("quarkus");
+
+        // Map of artifact patterns to library names
+        Map<String, String> artifactToLibrary = createArtifactToLibraryMapping();
+
+        // Analyze all dependencies
+        for (ResolvedDependency dependency : curateOutcomeBuildItem.getApplicationModel().getDependencies()) {
+            String artifactId = dependency.getArtifactId();
+            String groupId = dependency.getGroupId();
+
+            // Check if this dependency maps to a known library
+            for (Map.Entry<String, String> entry : artifactToLibrary.entrySet()) {
+                String pattern = entry.getKey();
+                String library = entry.getValue();
+
+                // Match by artifact pattern (contains check for flexibility)
+                if (artifactId.contains(pattern)) {
+                    libraries.add(library);
+                    LOG.debugf("Detected library '%s' from dependency %s:%s", library, groupId, artifactId);
+                }
+            }
+        }
+
+        if (libraries.size() > 1) {
+            LOG.infof("Chappie detected active libraries: %s", libraries);
+        }
+
+        activeLibrariesProducer.produce(new ActiveLibrariesBuildItem(libraries));
+    }
+
+    /**
+     * Creates mapping from Maven artifact patterns to documentation library names.
+     * This mapping determines which documentation is available based on project dependencies.
+     */
+    private Map<String, String> createArtifactToLibraryMapping() {
+        Map<String, String> mapping = new HashMap<>();
+
+        // Hibernate ORM
+        mapping.put("hibernate-orm", "hibernate-orm");
+        mapping.put("hibernate-core", "hibernate-orm");
+        mapping.put("hibernate-entitymanager", "hibernate-orm");
+
+        // SmallRye Config
+        mapping.put("smallrye-config", "smallrye-config");
+        mapping.put("microprofile-config", "smallrye-config");
+
+        // SmallRye Reactive Messaging
+        mapping.put("smallrye-reactive-messaging", "smallrye-reactive-messaging");
+        mapping.put("microprofile-reactive-messaging", "smallrye-reactive-messaging");
+
+        // SmallRye JWT
+        mapping.put("smallrye-jwt", "smallrye-jwt");
+        mapping.put("microprofile-jwt", "smallrye-jwt");
+
+        // SmallRye Fault Tolerance
+        mapping.put("smallrye-fault-tolerance", "smallrye-fault-tolerance");
+        mapping.put("microprofile-fault-tolerance", "smallrye-fault-tolerance");
+
+        // Add more library mappings as documentation sources are added
+        // mapping.put("pattern", "library-name");
+
+        return mapping;
     }
 
     @BuildStep
@@ -201,24 +281,34 @@ public class ChappieProcessor {
     }
 
     @BuildStep
-    public DevServicesResultBuildItem startPgvectorDevService(LaunchModeBuildItem launchMode,
-            DockerStatusBuildItem dockerStatus, ChappieConfig cfg) {
+    public DevServicesResultBuildItem startPgvectorDevService(
+            LaunchModeBuildItem launchMode,
+            DockerStatusBuildItem dockerStatus,
+            ChappieConfig cfg,
+            ActiveLibrariesBuildItem activeLibraries) {
 
         if (launchMode.getLaunchMode().isDevOrTest()
                 && cfg.augmenting().enabled()
                 && dockerStatus.isContainerRuntimeAvailable()) {
+
+            // Include active libraries in configuration
+            String librariesConfig = activeLibraries.getLibrariesAsString();
+
             return DevServicesResultBuildItem.owned()
                     .name("Assistant_Store")
                     .serviceConfig(cfg.augmenting())
                     .startable(this::createContainer)
                     .postStartHook(
-                            c -> LOG.infof("Chappie RAG Dev Service started from %s, JDBC=%s", c.getContainer().getImage(),
-                                    c.getContainer().getJdbcUrl()))
+                            c -> LOG.infof("Chappie RAG Dev Service started from %s, JDBC=%s, libraries=%s",
+                                    c.getContainer().getImage(),
+                                    c.getContainer().getJdbcUrl(),
+                                    librariesConfig))
                     .configProvider(Map.of(
                             "chappie.rag.db-kind", c -> "postgresql",
                             "chappie.rag.jdbc.url", c -> c.getContainer().getJdbcUrl(),
                             "chappie.rag.username", c -> c.getContainer().getUsername(),
                             "chappie.rag.password", c -> c.getContainer().getPassword(),
+                            "chappie.rag.libraries", c -> librariesConfig,
                             "chappie.rag.active", c -> "false"))
                     .build();
         }
